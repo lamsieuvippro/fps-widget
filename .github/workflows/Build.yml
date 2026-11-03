@@ -13,16 +13,22 @@ jobs:
 
       - name: Compile dylib
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 \
-            -isysroot "$SDK" \
+          set -o pipefail
+          ls -la
+          xcrun --sdk iphoneos clang -arch arm64 \
             -miphoneos-version-min=13.0 \
             -fobjc-arc -dynamiclib \
-            -framework UIKit -framework QuartzCore \
+            -Wno-deprecated-declarations \
+            -framework Foundation -framework CoreFoundation \
+            -framework CoreGraphics -framework UIKit -framework QuartzCore \
             -install_name @executable_path/Frameworks/FPSRAM.dylib \
-            -o FPSRAM.dylib FPSRAMOverlay.m
+            -o FPSRAM.dylib FPSRAMOverlay.m 2>&1 | tee build.log
+          ls -la FPSRAM.dylib
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: FPSRAM-dylib
-          path: FPSRAM.dylib
+          path: |
+            FPSRAM.dylib
+            build.log
