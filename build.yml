@@ -1,0 +1,28 @@
+name: Build FPSRAM dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -dynamiclib \
+            -framework UIKit -framework QuartzCore \
+            -install_name @executable_path/Frameworks/FPSRAM.dylib \
+            -o FPSRAM.dylib FPSRAMOverlay.m
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FPSRAM-dylib
+          path: FPSRAM.dylib
