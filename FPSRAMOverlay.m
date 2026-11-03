@@ -1,15 +1,28 @@
-// FPSRAMOverlay.m  (v3)
+// FPSRAMOverlay.m  (v4)
 // HUD không nền: FPS, thanh RAM 3 đoạn (dùng / trống / Metal), pin, giờ, CPU, GPU.
 // - Kéo 1 ngón để di chuyển (nhớ vị trí)
 // - Chạm 1 lần để thu gọn / mở rộng
 // - Chụm 2 ngón để đổi kích thước, hoặc nhấn giữ để đổi nhanh giữa các cỡ có sẵn
+// - Giới hạn RAM của app ở FR_RAM_LIMIT_MB (mặc định 1.9 GB): xem ghi chú ở dưới
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #import <mach/mach.h>
 #import <dlfcn.h>
+#import <unistd.h>
+#import <malloc/malloc.h>
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+// ===== GIỚI HẠN RAM =====
+// Giới hạn mềm (luôn bật): khi RAM của app (phys_footprint) vượt mức này, dylib sẽ
+//   1) trả lại các trang bộ nhớ đã free cho hệ thống (malloc_zone_pressure_relief)
+//   2) giả lập cảnh báo thiếu RAM để game tự xả cache/texture (tối đa 1 lần / 3 giây)
+// Không ép cứng được: nếu game vẫn giữ RAM thì con số vẫn có thể vượt mức.
+#define FR_RAM_LIMIT_MB 1946.0   // 1.9 GB
+// Giới hạn cứng (thử): đặt 1 thì xin hệ điều hành đặt trần jetsam cho process.
+// Vượt trần là game BỊ KILL. App sideload thường không có quyền nên có thể không có tác dụng.
+#define FR_TRY_HARD_LIMIT 0
 
 #pragma mark - Helpers
 
@@ -44,6 +57,26 @@ static void FRSysMem(double *used, double *freeB) {
     if (f > total) f = total;
     *freeB = f;
     *used = total - f;
+}
+
+// RAM của chính app (giống Xcode)
+static double FRAppBytes(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
+    return (double)info.phys_footprint;
+}
+
+static void FRApplyHardLimit(void) {
+#if FR_TRY_HARD_LIMIT
+    typedef int (*mc_t)(uint32_t, int32_t, uint32_t, void *, size_t);
+    mc_t mc = (mc_t)dlsym(RTLD_DEFAULT, "memorystatus_control");
+    if (mc) {
+        // 6 = MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT (giá trị tính bằng MB, vượt là bị kill)
+        int r = mc(6, getpid(), (uint32_t)FR_RAM_LIMIT_MB, NULL, 0);
+        NSLog(@"[FPSRAM] hard limit result: %d", r);
+    }
+#endif
 }
 
 // Bộ nhớ Metal mà process này đang cấp phát
@@ -156,7 +189,7 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
 
 @interface FRHud : NSObject
 @property (nonatomic, strong) UIView *root, *barBg;
-@property (nonatomic, strong) UILabel *fps, *bat, *clock, *load;
+@property (nonatomic, strong) UILabel *fps, *app, *bat, *clock, *load;
 @property (nonatomic, strong) NSArray<UIView *> *segs;
 @property (nonatomic, strong) NSArray<UILabel *> *segLabels;
 @property (nonatomic, strong) CADisplayLink *link;
@@ -164,7 +197,8 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
 @property (nonatomic) CFTimeInterval lastFPS, lastStat;
 @property (nonatomic) NSUInteger frames;
 @property (nonatomic) int fpsValue, lastCPU, lastGPU;
-@property (nonatomic) double usedB, freeB, metalB;
+@property (nonatomic) double usedB, freeB, metalB, appB;
+@property (nonatomic) CFTimeInterval lastTrim;
 @property (nonatomic) CGFloat scale, baseScale;
 @property (nonatomic) BOOL collapsed, placed;
 @end
@@ -182,11 +216,12 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
     self.scale = [d objectForKey:@"FRScale"] ? (CGFloat)[d doubleForKey:@"FRScale"] : 1.0;
     self.scale = MIN(MAX(self.scale, kMinScale), kMaxScale);
 
-    self.root = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 190, 98)];
+    self.root = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 190, 116)];
     self.root.backgroundColor = UIColor.clearColor;   // không nền
     self.root.layer.zPosition = CGFLOAT_MAX;
 
     self.fps   = FRLabel([UIColor colorWithWhite:0.92 alpha:1], NSTextAlignmentLeft);
+    self.app   = FRLabel([UIColor colorWithWhite:0.92 alpha:1], NSTextAlignmentLeft);
     self.bat   = FRLabel([UIColor colorWithRed:0.35 green:0.92 blue:0.35 alpha:1], NSTextAlignmentLeft);
     self.clock = FRLabel([UIColor colorWithWhite:0.80 alpha:1], NSTextAlignmentLeft);
     self.load  = FRLabel(UIColor.whiteColor, NSTextAlignmentLeft);
@@ -214,6 +249,7 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
 
     [self.root addSubview:self.fps];
     [self.root addSubview:self.barBg];
+    [self.root addSubview:self.app];
     [self.root addSubview:self.bat];
     [self.root addSubview:self.clock];
     [self.root addSubview:self.load];
@@ -271,7 +307,7 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
     BOOL c = self.collapsed;
     CGPoint o = self.root.frame.origin;
 
-    for (UIView *v in @[self.barBg, self.bat, self.clock, self.load]) v.hidden = c;
+    for (UIView *v in @[self.barBg, self.app, self.bat, self.clock, self.load]) v.hidden = c;
 
     if (c) {
         self.root.frame = CGRectMake(o.x, o.y, 70 * k, 20 * k);
@@ -280,14 +316,16 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
         self.fps.textAlignment = NSTextAlignmentLeft;
     } else {
         CGFloat W = 190 * k;
-        self.root.frame = CGRectMake(o.x, o.y, W, 98 * k);
+        self.root.frame = CGRectMake(o.x, o.y, W, 116 * k);
         self.fps.frame   = CGRectMake(0, 0, W, 20 * k);
         self.barBg.frame = CGRectMake(0, 24 * k, W, 18 * k);
         self.barBg.layer.cornerRadius = 3 * k;
-        self.bat.frame   = CGRectMake(0, 46 * k, W, 16 * k);
-        self.clock.frame = CGRectMake(0, 62 * k, W, 16 * k);
-        self.load.frame  = CGRectMake(0, 80 * k, W, 16 * k);
+        self.app.frame   = CGRectMake(0, 46 * k, W, 16 * k);
+        self.bat.frame   = CGRectMake(0, 64 * k, W, 16 * k);
+        self.clock.frame = CGRectMake(0, 80 * k, W, 16 * k);
+        self.load.frame  = CGRectMake(0, 98 * k, W, 16 * k);
         FRSetFont(self.fps, 15 * k, UIFontWeightBold);
+        FRSetFont(self.app, 12 * k, UIFontWeightBold);
         FRSetFont(self.bat, 12 * k, UIFontWeightBold);
         FRSetFont(self.clock, 12 * k, UIFontWeightRegular);
         [self layoutBar];
@@ -392,6 +430,14 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
     self.metalB = FRMetalBytes();
     [self layoutBar];
 
+    self.appB = FRAppBytes();
+    double limit = FR_RAM_LIMIT_MB * 1024.0 * 1024.0;
+    double ratio = self.appB / limit;
+    self.app.text = [NSString stringWithFormat:@"APP %@ / %@%@", FRFmt(self.appB), FRFmt(limit), ratio > 1 ? @" !" : @""];
+    self.app.textColor = ratio > 1 ? [UIColor colorWithRed:1.0 green:0.30 blue:0.30 alpha:1]
+                       : ratio > 0.8 ? [UIColor colorWithRed:1.0 green:0.85 blue:0.20 alpha:1]
+                                     : [UIColor colorWithWhite:0.92 alpha:1];
+
     UIDevice *dev = UIDevice.currentDevice;
     float lvl = dev.batteryLevel;
     BOOL charging = dev.batteryState == UIDeviceBatteryStateCharging || dev.batteryState == UIDeviceBatteryStateFull;
@@ -401,6 +447,28 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
     self.lastCPU = FRCPU();
     self.lastGPU = FRGPU();
     [self renderLoad];
+}
+
+// Giới hạn mềm: chạy mỗi ~0.5 giây, kể cả khi HUD đang thu gọn
+- (void)enforceLimit {
+    double limit = FR_RAM_LIMIT_MB * 1024.0 * 1024.0;
+    if (FRAppBytes() <= limit) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now - self.lastTrim < 3.0) return;
+    self.lastTrim = now;
+
+    malloc_zone_pressure_relief(NULL, 0);
+
+    UIApplication *a = UIApplication.sharedApplication;
+    SEL sel = NSSelectorFromString(@"_performMemoryWarning");
+    if ([a respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [a performSelector:sel];
+#pragma clang diagnostic pop
+    } else {
+        [NSNotificationCenter.defaultCenter postNotificationName:UIApplicationDidReceiveMemoryWarningNotification object:a];
+    }
 }
 
 - (void)tick:(CADisplayLink *)l {
@@ -415,6 +483,7 @@ static const CGFloat kMinScale = 0.6, kMaxScale = 2.5;
 
     [self attachIfNeeded];
     [self renderFPS];
+    [self enforceLimit];
     if (now - self.lastStat >= 1.0) {
         self.lastStat = now;
         if (!self.collapsed) [self updateStats];
@@ -427,6 +496,7 @@ static FRHud *gHud;
 
 __attribute__((constructor))
 static void FRInit(void) {
+    FRApplyHardLimit();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         gHud = [FRHud new];
